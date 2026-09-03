@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: 
+     branches:
       - 'feature/**'
   pull_request:
     branches: [main]
@@ -14,7 +14,7 @@ env:
 
 jobs:
   # ------------------------------------------------------------------
-  # 1. Unit tests + coverage. Everything else depends on this passing.
+  # 1. Unit tests + coverage.
   # ------------------------------------------------------------------
   test:
     runs-on: ubuntu-latest
@@ -50,8 +50,7 @@ jobs:
           path: coverage.xml
 
   # ------------------------------------------------------------------
-  # 2. Static analysis. Separate job so a Sonar outage cannot block
-  #    the image pipeline.
+  # 2. SonarQube — static analysis of the source.
   # ------------------------------------------------------------------
   sonar:
     runs-on: ubuntu-latest
@@ -60,7 +59,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0   # Sonar needs full history for new-code detection
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -80,18 +79,105 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
 
   # ------------------------------------------------------------------
-  # 3. Build -> scan -> gate -> push.
-  #    Image is built into the local daemon and scanned BEFORE any push,
-  #    so a failing gate means nothing reaches the registry.
+  # 3. Snyk — SCA on Python dependencies.
+  #    Overlaps with Trivy on purpose: different databases, different
+  #    findings. Snyk carries its own curated advisories and reachability
+  #    data; Trivy leans on public feeds. Two scanners is normal.
+  # ------------------------------------------------------------------
+  snyk:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      security-events: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+        # Snyk resolves the real installed tree rather than guessing from
+        # requirements.txt, which is what catches transitive dependencies.
+
+      - name: Set up Snyk CLI
+        uses: snyk/actions/setup@master
+
+      - name: Run Snyk dependency scan
+        continue-on-error: true    # never fail here — the gate step decides
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        run: |
+          snyk test \
+            --file=requirements.txt \
+            --package-manager=pip \
+            --json-file-output=snyk.json \
+            --sarif-file-output=snyk.sarif
+
+      - name: Annotate and gate on Snyk findings
+        env:
+          FAIL_ON_HIGH: 'false'    # flip to 'true' once the baseline is clean
+        run: |
+          if [ ! -f snyk.json ]; then
+            echo "No Snyk output produced — check the SNYK_TOKEN secret."
+            exit 1
+          fi
+
+          # Snyk reports the same vulnerability once per dependency path,
+          # so deduplicate by id before counting or you inflate the numbers.
+          NORM='(if type=="array" then .[] else . end) | .vulnerabilities[]?'
+
+          CRIT=$(jq "[ $NORM ] | unique_by(.id) | map(select(.severity==\"critical\")) | length" snyk.json)
+          HIGH=$(jq "[ $NORM ] | unique_by(.id) | map(select(.severity==\"high\")) | length" snyk.json)
+
+          jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"critical\")
+            | \"::error title=\(.id)::\(.packageName) \(.version) — \(.title) — fixed in \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end)\"" \
+            snyk.json | head -n 10
+          jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"high\")
+            | \"::warning title=\(.id)::\(.packageName) \(.version) — \(.title) — fixed in \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end)\"" \
+            snyk.json | head -n 10
+
+          {
+            echo "### Snyk dependency scan: $CRIT critical, $HIGH high"
+            echo
+            echo "| Severity | ID | Package | Installed | Fixed in |"
+            echo "|---|---|---|---|---|"
+            jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"critical\" or .severity==\"high\")
+              | \"| \(.severity) | \(.id) | \(.packageName) | \(.version) | \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end) |\"" \
+              snyk.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CRIT" -gt 0 ]; then
+            echo "Blocking: $CRIT critical dependency vulnerabilities."
+            exit 1
+          fi
+          if [ "$FAIL_ON_HIGH" = "true" ] && [ "$HIGH" -gt 0 ]; then
+            echo "Blocking: $HIGH high dependency vulnerabilities."
+            exit 1
+          fi
+          echo "Snyk gate passed: $CRIT critical, $HIGH high."
+
+      - name: Upload Snyk SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk        # keeps Snyk and Trivy results separate
+
+  # ------------------------------------------------------------------
+  # 4. Build -> scan -> gate -> push.
   # ------------------------------------------------------------------
   build-and-push:
-    # To run on the homelab runner instead: runs-on: gh-runner
-    # (needs a runner registered to THIS repo, and jq installed on it)
     runs-on: ubuntu-latest
+    needs: test
     permissions:
       contents: read
       packages: write
-      security-events: write   # for SARIF upload to Security > Code scanning
+      security-events: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -125,14 +211,14 @@ jobs:
           image-ref: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
           format: 'json'
           output: 'trivy-results.json'
-          exit-code: '0'          # don't fail here — the gate step below decides
+          exit-code: '0'
           ignore-unfixed: true
           vuln-type: 'os,library'
           severity: 'CRITICAL,HIGH'
 
       - name: Annotate and gate on findings
         env:
-          FAIL_ON_HIGH: 'false'   # start permissive; flip to 'true' once baseline is clean
+          FAIL_ON_HIGH: 'false'
         run: |
           CRIT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results.json)
           HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' trivy-results.json)
@@ -145,7 +231,7 @@ jobs:
             trivy-results.json | head -n 10
 
           {
-            echo "### Trivy scan: $CRIT critical, $HIGH high"
+            echo "### Trivy image scan: $CRIT critical, $HIGH high"
             echo
             echo "| Severity | ID | Package | Installed | Fixed |"
             echo "|---|---|---|---|---|"
@@ -164,7 +250,6 @@ jobs:
           fi
           echo "Gate passed: $CRIT critical, $HIGH high."
 
-      # Optional but cheap: findings land in Security > Code scanning with history.
       - name: Re-scan as SARIF for the Security tab
         if: always()
         uses: aquasecurity/trivy-action@v0.36.0
@@ -176,11 +261,12 @@ jobs:
           ignore-unfixed: true
           severity: 'CRITICAL,HIGH'
 
-      - name: Upload SARIF
+      - name: Upload Trivy SARIF
         if: always()
         uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
+          category: trivy
 
       - name: Log in to Docker Hub
         if: github.ref == 'refs/heads/main'
