@@ -87,7 +87,6 @@ jobs:
     # To run on the homelab runner instead: runs-on: gh-runner
     # (needs a runner registered to THIS repo, and jq installed on it)
     runs-on: ubuntu-latest
-    needs: test
     permissions:
       contents: read
       packages: write
