@@ -1,0 +1,56 @@
+# Dependabot - the automated remediation layer.
+#
+# Scanners (Trivy, CodeQL) FIND problems. Dependabot FIXES them: it
+# watches your manifests and opens a PR when a newer or security-patched
+# version exists. Without it, every finding is manual work forever.
+#
+# Lives at .github/dependabot.yml - NOT inside .github/workflows/.
+# It is not a workflow; GitHub reads it directly.
+version: 2
+updates:
+  # ---- Python dependencies ----
+  # This is the layer that caught the starlette CVEs. Dependabot would
+  # have opened the FastAPI bump PR before the scan ever flagged them.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    target-branch: "main"
+    commit-message:
+      prefix: "deps"
+    labels:
+      - "dependencies"
+
+  # ---- Docker base image ----
+  # Watches `FROM python:3.12-slim`. Updating the base image is the
+  # RIGHT fix for OS CVEs - `apt-get upgrade` is the fallback, because
+  # it makes builds non-reproducible.
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    target-branch: "main"
+    commit-message:
+      prefix: "docker"
+    labels:
+      - "dependencies"
+
+  # ---- GitHub Actions used by the workflows ----
+  # The most security-relevant of the three. A tag like @v4 is a MOVING
+  # POINTER - whoever owns the action can repoint it at new code. That is
+  # the supply-chain attack pattern behind the 2026 npm worm campaigns.
+  # Keeping actions current (and ideally pinned to commit SHAs) is the
+  # defence.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 3
+    target-branch: "main"
+    commit-message:
+      prefix: "ci"
+    labels:
+      - "dependencies"
+      - "github-actions"

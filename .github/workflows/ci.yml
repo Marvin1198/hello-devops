@@ -2,11 +2,19 @@ name: CI
 
 on:
   push:
-     branches:
-      - 'feature/**'
+    branches:
+      - main            # merges to main -> full run, image IS pushed
+      - 'feature/**'    # feature work    -> build + scan, image NOT pushed
   pull_request:
-    branches: [main]
-  workflow_dispatch:
+    branches: [main]    # PRs into main   -> build + scan, image NOT pushed
+  workflow_dispatch:    # manual "Run workflow" button
+
+# Cancels an in-flight run when you push again to the same branch, so
+# five quick commits do not queue five full pipelines. main is excluded
+# from cancellation - you never want a half-finished release run killed.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
 
 env:
   REGISTRY: docker.io
@@ -79,6 +87,50 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
 
   # ------------------------------------------------------------------
+  # 3. CodeQL - SAST. Analyses YOUR source code for vulnerable patterns
+  #    (injection, unsafe deserialisation, hardcoded secrets, etc).
+  #
+  #    This is a DIFFERENT question from Trivy's. CodeQL asks "did we
+  #    write a bug?"; Trivy asks "did we ship a known-vulnerable
+  #    package?". Neither substitutes for the other.
+  #
+  #    The `actions` language scans the workflow files themselves -
+  #    script injection via untrusted PR titles is a real class of
+  #    supply-chain attack.
+  # ------------------------------------------------------------------
+  codeql:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      security-events: write   # to publish alerts
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false         # one language failing must not hide the other
+      matrix:
+        language: [python, actions]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none     # Python is interpreted - nothing to compile
+          queries: security-extended
+          # default          = high confidence, low noise
+          # security-extended = more queries, more false positives
+          # security-and-quality = adds maintainability checks
+
+      - name: Perform CodeQL analysis
+        uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          # Distinct category per language, or the second upload
+          # overwrites the first - same rule as the SARIF uploads below.
+
+  # ------------------------------------------------------------------
   # 3. Security gates -> build -> image scan -> push.
   #    Everything security-related happens BEFORE the single push step,
   #    so a failing gate means nothing reaches the registry.
@@ -93,72 +145,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
-      # ---- SCA gate: Python dependencies, before anything is built ----
-      # Fail fast. No point building an image from a dependency tree that
-      # already fails policy.
-      - name: Run Snyk to check for vulnerabilities
-        uses: snyk/actions/python-3.12@master
-        continue-on-error: true      # snyk exits non-zero on findings; the gate below decides
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        with:
-          args: >-
-            --file=requirements.txt
-            --package-manager=pip
-            --json-file-output=snyk.json
-            --sarif-file-output=snyk.sarif
-
-      - name: Annotate and gate on Snyk findings
-        env:
-          SNYK_FAIL_ON_HIGH: 'false'    # flip to 'true' once the baseline is clean
-        run: |
-          if [ ! -f snyk.json ]; then
-            echo "No Snyk output produced - check the SNYK_TOKEN secret."
-            exit 1
-          fi
-
-          # Snyk reports the same vulnerability once per dependency path,
-          # so deduplicate by id or the counts come out inflated.
-          jq '[ (if type=="array" then .[] else . end) | .vulnerabilities[]? ] | unique_by(.id)' \
-            snyk.json > snyk-uniq.json
-
-          CRIT=$(jq '[.[] | select(.severity=="critical")] | length' snyk-uniq.json)
-          HIGH=$(jq '[.[] | select(.severity=="high")] | length' snyk-uniq.json)
-
-          jq -r '.[] | select(.severity=="critical")
-            | "::error title=\(.id)::\(.packageName) \(.version) - \(.title) - fixed in \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end)"' \
-            snyk-uniq.json | head -n 10
-          jq -r '.[] | select(.severity=="high")
-            | "::warning title=\(.id)::\(.packageName) \(.version) - \(.title) - fixed in \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end)"' \
-            snyk-uniq.json | head -n 10
-
-          {
-            echo "### Snyk dependency scan: $CRIT critical, $HIGH high"
-            echo
-            echo "| Severity | ID | Package | Installed | Fixed in |"
-            echo "|---|---|---|---|---|"
-            jq -r '.[] | select(.severity=="critical" or .severity=="high")
-              | "| \(.severity) | \(.id) | \(.packageName) | \(.version) | \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end) |"' \
-              snyk-uniq.json
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$CRIT" -gt 0 ]; then
-            echo "Blocking: $CRIT critical dependency vulnerabilities."
-            exit 1
-          fi
-          if [ "$SNYK_FAIL_ON_HIGH" = "true" ] && [ "$HIGH" -gt 0 ]; then
-            echo "Blocking: $HIGH high dependency vulnerabilities."
-            exit 1
-          fi
-          echo "Snyk gate passed: $CRIT critical, $HIGH high."
-
-      - name: Upload Snyk SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: snyk.sarif
-          category: snyk        # distinct category, or it overwrites Trivy's results
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
