@@ -15,8 +15,15 @@ RUN pip install --no-cache-dir -r requirements.txt
 # ---------- stage 2: runtime ----------
 FROM python:3.12-slim AS runtime
 
-# Never run as root. Kubernetes can enforce this, but the image should not rely on it.
-RUN useradd --create-home --uid 1001 appuser
+# Patch OS packages inherited from the base image, then create the app user.
+# update + upgrade + cleanup MUST be one RUN: a cached `apt-get update` layer
+# paired with a fresh `upgrade` fetches package versions that no longer exist.
+# Removing /var/lib/apt/lists keeps the cache out of the shipped layer.
+RUN apt-get update \
+    && apt-get upgrade -y --no-install-recommends \
+    && apt-get clean \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --create-home --uid 1001 appuser
 
 COPY --from=builder /opt/venv /opt/venv
 
