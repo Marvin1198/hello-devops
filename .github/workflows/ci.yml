@@ -79,97 +79,9 @@ jobs:
           SONAR_HOST_URL: https://sonarcloud.io
 
   # ------------------------------------------------------------------
-  # 3. Snyk — SCA on Python dependencies.
-  #    Overlaps with Trivy on purpose: different databases, different
-  #    findings. Snyk carries its own curated advisories and reachability
-  #    data; Trivy leans on public feeds. Two scanners is normal.
-  # ------------------------------------------------------------------
-  snyk:
-    runs-on: ubuntu-latest
-    needs: test
-    permissions:
-      contents: read
-      security-events: write
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-          cache: pip
-
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-        # Snyk resolves the real installed tree rather than guessing from
-        # requirements.txt, which is what catches transitive dependencies.
-
-      - name: Set up Snyk CLI
-        uses: snyk/actions/setup@master
-
-      - name: Run Snyk dependency scan
-        continue-on-error: true    # never fail here — the gate step decides
-        env:
-          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
-        run: |
-          snyk test \
-            --file=requirements.txt \
-            --package-manager=pip \
-            --json-file-output=snyk.json \
-            --sarif-file-output=snyk.sarif
-
-      - name: Annotate and gate on Snyk findings
-        env:
-          FAIL_ON_HIGH: 'false'    # flip to 'true' once the baseline is clean
-        run: |
-          if [ ! -f snyk.json ]; then
-            echo "No Snyk output produced — check the SNYK_TOKEN secret."
-            exit 1
-          fi
-
-          # Snyk reports the same vulnerability once per dependency path,
-          # so deduplicate by id before counting or you inflate the numbers.
-          NORM='(if type=="array" then .[] else . end) | .vulnerabilities[]?'
-
-          CRIT=$(jq "[ $NORM ] | unique_by(.id) | map(select(.severity==\"critical\")) | length" snyk.json)
-          HIGH=$(jq "[ $NORM ] | unique_by(.id) | map(select(.severity==\"high\")) | length" snyk.json)
-
-          jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"critical\")
-            | \"::error title=\(.id)::\(.packageName) \(.version) — \(.title) — fixed in \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end)\"" \
-            snyk.json | head -n 10
-          jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"high\")
-            | \"::warning title=\(.id)::\(.packageName) \(.version) — \(.title) — fixed in \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end)\"" \
-            snyk.json | head -n 10
-
-          {
-            echo "### Snyk dependency scan: $CRIT critical, $HIGH high"
-            echo
-            echo "| Severity | ID | Package | Installed | Fixed in |"
-            echo "|---|---|---|---|---|"
-            jq -r "[ $NORM ] | unique_by(.id) | .[] | select(.severity==\"critical\" or .severity==\"high\")
-              | \"| \(.severity) | \(.id) | \(.packageName) | \(.version) | \(if (.fixedIn // []) | length > 0 then (.fixedIn | join(\", \")) else \"unfixed\" end) |\"" \
-              snyk.json
-          } >> "$GITHUB_STEP_SUMMARY"
-
-          if [ "$CRIT" -gt 0 ]; then
-            echo "Blocking: $CRIT critical dependency vulnerabilities."
-            exit 1
-          fi
-          if [ "$FAIL_ON_HIGH" = "true" ] && [ "$HIGH" -gt 0 ]; then
-            echo "Blocking: $HIGH high dependency vulnerabilities."
-            exit 1
-          fi
-          echo "Snyk gate passed: $CRIT critical, $HIGH high."
-
-      - name: Upload Snyk SARIF
-        if: always()
-        uses: github/codeql-action/upload-sarif@v3
-        with:
-          sarif_file: snyk.sarif
-          category: snyk        # keeps Snyk and Trivy results separate
-
-  # ------------------------------------------------------------------
-  # 4. Build -> scan -> gate -> push.
+  # 3. Security gates -> build -> image scan -> push.
+  #    Everything security-related happens BEFORE the single push step,
+  #    so a failing gate means nothing reaches the registry.
   # ------------------------------------------------------------------
   build-and-push:
     runs-on: ubuntu-latest
@@ -181,6 +93,72 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      # ---- SCA gate: Python dependencies, before anything is built ----
+      # Fail fast. No point building an image from a dependency tree that
+      # already fails policy.
+      - name: Run Snyk to check for vulnerabilities
+        uses: snyk/actions/python-3.12@master
+        continue-on-error: true      # snyk exits non-zero on findings; the gate below decides
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        with:
+          args: >-
+            --file=requirements.txt
+            --package-manager=pip
+            --json-file-output=snyk.json
+            --sarif-file-output=snyk.sarif
+
+      - name: Annotate and gate on Snyk findings
+        env:
+          SNYK_FAIL_ON_HIGH: 'false'    # flip to 'true' once the baseline is clean
+        run: |
+          if [ ! -f snyk.json ]; then
+            echo "No Snyk output produced - check the SNYK_TOKEN secret."
+            exit 1
+          fi
+
+          # Snyk reports the same vulnerability once per dependency path,
+          # so deduplicate by id or the counts come out inflated.
+          jq '[ (if type=="array" then .[] else . end) | .vulnerabilities[]? ] | unique_by(.id)' \
+            snyk.json > snyk-uniq.json
+
+          CRIT=$(jq '[.[] | select(.severity=="critical")] | length' snyk-uniq.json)
+          HIGH=$(jq '[.[] | select(.severity=="high")] | length' snyk-uniq.json)
+
+          jq -r '.[] | select(.severity=="critical")
+            | "::error title=\(.id)::\(.packageName) \(.version) - \(.title) - fixed in \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end)"' \
+            snyk-uniq.json | head -n 10
+          jq -r '.[] | select(.severity=="high")
+            | "::warning title=\(.id)::\(.packageName) \(.version) - \(.title) - fixed in \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end)"' \
+            snyk-uniq.json | head -n 10
+
+          {
+            echo "### Snyk dependency scan: $CRIT critical, $HIGH high"
+            echo
+            echo "| Severity | ID | Package | Installed | Fixed in |"
+            echo "|---|---|---|---|---|"
+            jq -r '.[] | select(.severity=="critical" or .severity=="high")
+              | "| \(.severity) | \(.id) | \(.packageName) | \(.version) | \((.fixedIn // []) | if length > 0 then join(", ") else "unfixed" end) |"' \
+              snyk-uniq.json
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          if [ "$CRIT" -gt 0 ]; then
+            echo "Blocking: $CRIT critical dependency vulnerabilities."
+            exit 1
+          fi
+          if [ "$SNYK_FAIL_ON_HIGH" = "true" ] && [ "$HIGH" -gt 0 ]; then
+            echo "Blocking: $HIGH high dependency vulnerabilities."
+            exit 1
+          fi
+          echo "Snyk gate passed: $CRIT critical, $HIGH high."
+
+      - name: Upload Snyk SARIF
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: snyk.sarif
+          category: snyk        # distinct category, or it overwrites Trivy's results
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3
