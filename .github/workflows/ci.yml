@@ -127,8 +127,61 @@ jobs:
         uses: github/codeql-action/analyze@v3
         with:
           category: "/language:${{ matrix.language }}"
-          # Distinct category per language, or the second upload
-          # overwrites the first - same rule as the SARIF uploads below.
+          output: sarif-results     # ALSO write the SARIF to disk so we can parse it
+          upload: always            # still publish to Security > Code scanning
+
+      - name: Annotate CodeQL findings
+        if: always()
+        run: |
+          FILE=$(find sarif-results -name '*.sarif' | head -n 1)
+          if [ -z "$FILE" ]; then
+            echo "No SARIF produced for ${{ matrix.language }}."
+            exit 0
+          fi
+
+          # SARIF keeps findings in .runs[].results[] but severity on the RULE,
+          # so join each result back to its rule by id.
+          # GitHub's security-severity is a CVSS-style number:
+          #   >= 9.0 critical | >= 7.0 high | >= 4.0 medium | else low
+          jq -r '
+            .runs[]
+            | (.tool.driver.rules // []) as $rules
+            | .results[]?
+            | . as $r
+            | ($rules[] | select(.id == $r.ruleId)) as $rule
+            | ($rule.properties["security-severity"] // "0" | tonumber) as $score
+            | (if $score >= 9.0 then "critical"
+               elif $score >= 7.0 then "high"
+               elif $score >= 4.0 then "medium"
+               else "low" end) as $sev
+            | [$sev, $r.ruleId,
+               ($r.locations[0].physicalLocation.artifactLocation.uri // "?"),
+               ($r.locations[0].physicalLocation.region.startLine // 0),
+               ($r.message.text | gsub("\n"; " "))]
+            | @tsv
+          ' "$FILE" > findings.tsv
+
+          CRIT=$(awk -F"\t" '$1=="critical"' findings.tsv | wc -l)
+          HIGH=$(awk -F"\t" '$1=="high"' findings.tsv | wc -l)
+          TOTAL=$(wc -l < findings.tsv)
+
+          # ::error / ::warning with file+line render inline on the diff.
+          awk -F"\t" '$1=="critical" {printf "::error file=%s,line=%s,title=%s::%s\n", $3, $4, $2, $5}' findings.tsv | head -n 20
+          awk -F"\t" '$1=="high"     {printf "::warning file=%s,line=%s,title=%s::%s\n", $3, $4, $2, $5}' findings.tsv | head -n 20
+
+          {
+            echo "### CodeQL (${{ matrix.language }}): $CRIT critical, $HIGH high, $TOTAL total"
+            echo
+            if [ "$TOTAL" -eq 0 ]; then
+              echo "No findings."
+            else
+              echo "| Severity | Rule | File | Line | Message |"
+              echo "|---|---|---|---|---|"
+              awk -F"\t" '{printf "| %s | %s | %s | %s | %s |\n", $1, $2, $3, $4, $5}' findings.tsv
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "CodeQL ${{ matrix.language }}: $CRIT critical, $HIGH high, $TOTAL total."
 
   # ------------------------------------------------------------------
   # 3. Security gates -> build -> image scan -> push.
